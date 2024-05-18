@@ -1,6 +1,5 @@
-from enum import Enum
+import logging
 from typing import List, Iterator
-
 import numpy as np
 import torch
 from torch import Tensor
@@ -9,7 +8,8 @@ from transformers.trainer_utils import BiasSamplingStrategy
 
 
 class BiasBatchSampler(Sampler[List[int]]):
-    def __init__(self, bias_indices: Tensor, ds_len: int, batch_size: int, drop_last: bool, sampling_strategy: BiasSamplingStrategy) -> None:
+    def __init__(self, bias_indices: Tensor, ds_len: int, batch_size: int, drop_last: bool,
+                 sampling_strategy: BiasSamplingStrategy) -> None:
         # Since collections.abc.Iterable does not check for `__getitem__`, which
         # is one way for an object to be an iterable, we don't do an `isinstance`
         # check here.
@@ -17,6 +17,7 @@ class BiasBatchSampler(Sampler[List[int]]):
                 batch_size <= 0:
             raise ValueError("batch_size should be a positive integer value, "
                              "but got batch_size={}".format(batch_size))
+        logging.info("initializing BiasBatchSampler")
         self.batch_size = batch_size
         self.bias_indices = bias_indices
         self.other_indices = torch.tensor(np.setdiff1d(np.arange(ds_len), np.array(bias_indices)))
@@ -35,7 +36,8 @@ class BiasBatchSampler(Sampler[List[int]]):
         remaining_other_batches = self.num_other_batches
         current_rest_perm = torch.randperm(len(self.other_indices)).tolist()
         if self.sampling_strategy == BiasSamplingStrategy.STOCHASTIC:
-            self.bias_turn = bool(torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (remaining_bias_batchess + remaining_other_batches)).item())
+            self.bias_turn = bool(torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (
+                        remaining_bias_batchess + remaining_other_batches)).item())
 
         for i in range(len(self)):
             if self.bias_turn:
@@ -50,7 +52,8 @@ class BiasBatchSampler(Sampler[List[int]]):
                     if remaining_bias_batchess + remaining_other_batches == 0:
                         break
                     self.bias_turn = bool(
-                        torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (remaining_bias_batchess + remaining_other_batches)).item())
+                        torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (
+                                    remaining_bias_batchess + remaining_other_batches)).item())
                 elif self.sampling_strategy == BiasSamplingStrategy.DOWN_SAMPLING:
                     if remaining_bias_batchess == 0:
                         bias_i = 0
@@ -69,7 +72,8 @@ class BiasBatchSampler(Sampler[List[int]]):
                     if remaining_bias_batchess + remaining_other_batches == 0:
                         break
                     self.bias_turn = bool(
-                        torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (remaining_bias_batchess + remaining_other_batches)).item())
+                        torch.bernoulli(torch.zeros(1), remaining_bias_batchess / (
+                                    remaining_bias_batchess + remaining_other_batches)).item())
                 elif self.sampling_strategy == BiasSamplingStrategy.DOWN_SAMPLING:
                     if remaining_other_batches == 0:
                         rest_i = 0

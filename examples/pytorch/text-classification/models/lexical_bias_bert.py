@@ -3,7 +3,7 @@ from typing import Iterable, List
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from transformers import BertPreTrainedModel, BertModel, BertConfig
+from transformers import BertPreTrainedModel, BertModel, BertConfig, PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import SequenceClassifierOutput
 
 
@@ -52,13 +52,13 @@ def _get_word_similarity(hyp_matrix: Tensor, prem_matrix: Tensor,
     return similarity_score
 
 
-class ClarkLexicalBiasConfig(BertConfig):
+class ClarkLexicalBiasConfig(PretrainedConfig):
     pass
 
 
-
-class ClarkLexicalBiasModel(BertPreTrainedModel):
+class ClarkLexicalBiasModel(PreTrainedModel):
     config_class = ClarkLexicalBiasConfig
+    base_model_prefix = "lexical"
 
     def __init__(self, config: ClarkLexicalBiasConfig):
         super().__init__(config)
@@ -74,20 +74,29 @@ class ClarkLexicalBiasModel(BertPreTrainedModel):
             nn.ReLU(),
             nn.Linear(h_dim, h_dim),
             nn.ReLU(),
-            nn.Linear(h_dim, 2)
+            nn.Linear(h_dim, self.num_labels)
         )
         self.loss_fn = nn.CrossEntropyLoss()
 
-        # def init_weights(m):
-        #     if isinstance(m, nn.Linear):
-        #         torch.nn.init.xavier_uniform(m.weight)
-        #         m.bias.data.fill_(0.01)
-        #
-        # self.classifier.apply(init_weights)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            m.bias.data.fill_(0.01)
+
+    # def _init_weights(self, module):
+    #     """Initialize the weights"""
+    #     if isinstance(module, nn.Linear):
+    #         module.weight.data.normal_(mean=0.0, std=0.02)
+    #         if module.bias is not None:
+    #             module.bias.data.zero_()
+    #     elif isinstance(module, nn.LayerNorm):
+    #         module.bias.data.zero_()
+    #         module.weight.data.fill_(1.0)
 
     def forward(self, h_is_subseq, all_in_p, percent_in_p, percent_in_q, log_len_diff, labels, average_sim, min_similarity, min2_similarity, **kwargs):
         logits = self.classifier(
-            torch.stack([h_is_subseq, all_in_p, percent_in_p, percent_in_q, log_len_diff, average_sim, min_similarity, min2_similarity], dim=1))
+            torch.stack([h_is_subseq, all_in_p, percent_in_p, percent_in_q, log_len_diff, average_sim, min_similarity, min2_similarity], dim=1)
+        )
         if labels is None:
             return SequenceClassifierOutput(logits=logits)
         loss = self.loss_fn(logits, labels)

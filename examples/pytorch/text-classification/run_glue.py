@@ -1,21 +1,5 @@
 #!/usr/bin/env python
-# coding=utf-8
-# Copyright 2020 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" Finetuning the library models for sequence classification on GLUE."""
-# You can also adapt this script on your own text classification task. Pointers for this are left as comments.
-
+import json
 import logging
 import os
 import random
@@ -41,12 +25,14 @@ from transformers import (
     PreTrainedTokenizer
 )
 
+from poe_trainer import PoETrainer
 from conf_reg_trainer import ConfRegTrainer
-from grad_reg_trainer import BaseGradRegTrainer
-from loss_sampling_trainer import MisclassificationTrainer, TopKLossTrainer
+# from grad_reg_trainer import BaseGradRegTrainer
+# from loss_sampling_trainer import MisclassificationTrainer, TopKLossTrainer
 from models.lexical_bias_bert import ClarkLexicalBiasModel, ClarkLexicalBiasConfig
-from my_trainer import selfReg, BaseTrainer, SimRegTrainer
-from models import PartialInputBert, BertWithLexicalBiasModel, BertWithLexicalBiasConfig
+from models.models_weak import BaselineTokenizer, BaselineConfig, BaselineModel
+from my_trainer import BaseTrainer, SimRegTrainer
+from models import BertWithLexicalBiasModel, BertWithLexicalBiasConfig
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -57,33 +43,20 @@ from metrics import get_metrics_function
 from utils.misc import EvaluationSet, extract_split_name, is_partial_input_model
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-from poe_trainer import PoETrainer
 check_min_version("4.12.0.dev0")
-
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
-
 logger = logging.getLogger(__name__)
-
-from utils.misc import DATA_DIR, lexical_bias_cache_mapper
+from utils.misc import DATA_DIR, setup_wandb
 
 
 def main(outside_usage=False):
     data_args, last_checkpoint, model_args, training_args, *other_args = setup_args((WandbArguments,))
+    wandb_args: WandbArguments = other_args[0]
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    if data_args.synthetic_bias_prevalence > 0:
-        os.environ.setdefault('WANDB_PROJECT', 'synthetic_bias')
-    elif data_args.task_name is not None:
-        os.environ.setdefault('WANDB_PROJECT', f'{data_args.task_name}_exps')
-
-    wandb_args: WandbArguments = other_args[0]
-    if wandb_args.tags is not None:
-        os.environ.setdefault('WANDB_TAGS', ",".join(wandb_args.tags))
-
-    if wandb_args.wandb_group:
-        os.environ.setdefault('WANDB_RUN_GROUP', training_args.run_name)
+    setup_wandb(data_args, wandb_args, training_args)
 
     raw_datasets = load_datasets(data_args, model_args, training_args)
 
@@ -92,13 +65,20 @@ def main(outside_usage=False):
 
     is_regression, label_list, num_labels = load_labels(data_args, raw_datasets)
 
-    config, model, tokenizer, weak_model, weak_tokenizer, lexical_bias_settings = load_models(
+    config, model, tokenizer, weak_models, weak_tokenizers, lexical_bias_settings = load_models(
         data_args=data_args,
         model_args=model_args,
         training_args=training_args,
         num_labels=num_labels
     )
-    training_args.seperate_weak_tokenization = weak_tokenizer.getvocab() == tokenizer.getvocab()
+
+    training_args.separate_weak_tokenization = any(
+        wt is not None and wt.get_vocab() != tokenizer.get_vocab() for wt in weak_tokenizers)
+    logger.info(f"separate_weak_tokenization: {training_args.separate_weak_tokenization}")
+
+    if training_args.separate_weak_tokenization and not data_args.pad_to_max_length:
+        data_args.pad_to_max_length = True
+        logger.warning('setting pad_to_max_length to True!')
 
     # Preprocessing the raw_datasets
     if data_args.task_name is not None:
@@ -150,12 +130,12 @@ def main(outside_usage=False):
         model.config.label2id = {l: i for i, l in enumerate(label_list)}
         model.config.id2label = {id: label for label, id in config.label2id.items()}
 
-    if data_args.max_seq_length > tokenizer.model_max_length:
+    if tokenizer is not None and data_args.max_seq_length > tokenizer.model_max_length:
         logger.warning(
             f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
             f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
         )
-    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
+    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length if tokenizer is not None else 0)
     assert not (lexical_bias_settings and data_args.synthetic_bias_prevalence > 0)
 
     preprocessing_func = get_preprocess_function(
@@ -165,8 +145,8 @@ def main(outside_usage=False):
         max_seq_length=max_seq_length,
         padding=padding,
         label_to_id=label_to_id,
-        weak_tokenizer=weak_tokenizer if not lexical_bias_settings else None
-    )
+        weak_tokenizers=weak_tokenizers if training_args.separate_weak_tokenization else None
+    ) if tokenizer is not None else None
     synthetic_bias_indices, raw_datasets = preprocess_raw_datasets(
         data_args=data_args,
         training_args=training_args,
@@ -176,6 +156,39 @@ def main(outside_usage=False):
         lexical_bias_settings=lexical_bias_settings,
         preprocessing_func=preprocessing_func
     )
+    if data_args.old_labels_order:
+        # datasets module MNLI labels order: entailment, neutral, contradiction.
+        # POE project mnli labels order: contradiction, entailment, neutral
+        # ['entailment', 'non-entailment']
+        # datasets module HANS labels order: entailment, non-entailment
+        # ["non-entailment", "entailment"]
+        # POE project HANS labels order: non-entailment, entailment
+
+        # FEVER:
+        # my code: ["SUPPORTS", "NOT ENOUGH INFO", "REFUTES"]
+        # old : ["REFUTES", "SUPPORTS", "NOT ENOUGH INFO"]
+
+        old_labels_mapper = {0: 1, 1: 2, 2: 0}
+        hans_labels_map = {0: 1, 1: 0}
+        hans_ds = None
+        if 'hans' in raw_datasets:
+            hans_ds = raw_datasets.pop('hans')
+
+        def labels_mapper(samples):
+            samples['label'] = ((torch.tensor(samples['label']) + 1) % 3).tolist()
+            # samples['label'] = [(old_labels_mapper[l] if l != -1 else -1) for l in samples["label"]]
+            return samples
+
+        def hans_labels_mapper(samples):
+            samples['label'] = [(hans_labels_map[l] if l != -1 else -1) for l in samples["label"]]
+            return samples
+
+        raw_datasets = raw_datasets.map(labels_mapper, batched=True, load_from_cache_file=False)
+
+        if hans_ds is not None:
+            raw_datasets['hans'] = hans_ds.map(hans_labels_mapper, batched=True, load_from_cache_file=False)
+        del hans_ds
+
     if data_args.task_name == 'qqp':
         raw_datasets = raw_datasets.remove_columns(['question1', 'question2'])
 
@@ -213,52 +226,7 @@ def main(outside_usage=False):
     else:
         data_collator = None
 
-    evaluation_sets: List[EvaluationSet] = []
-
-    # adding HANS sets
-    if training_args.evaluate_on_hans:
-        from metrics import hans_compute_metrics
-        hans_ds = raw_datasets['hans']
-        hans_mask = np.array(hans_ds['label']) == 0
-        hans_ent = hans_ds.select(np.nonzero(hans_mask)[0])
-        evaluation_sets.append(EvaluationSet(set=hans_ent, logging_mode='eval_HANS_ent', metrics_func=hans_compute_metrics))
-        hans_non_ent = hans_ds.select(np.nonzero(~hans_mask)[0])
-        evaluation_sets.append(EvaluationSet(set=hans_non_ent, logging_mode='eval_HANS_non_ent', metrics_func=hans_compute_metrics))
-
-    # adding validation matched subsets
-    if data_args.indices_dir is not None:
-        for split_dir in data_args.indices_dir:
-            splits = os.listdir(split_dir)
-            for split_file_name in splits:
-                if split_file_name.split(".")[-1] != "bin":
-                    continue
-                split_indices = torch.load(os.path.join(split_dir, split_file_name))
-                split_ds = eval_dataset.select(split_indices)
-                split_name = extract_split_name(split_dir, split_file_name)
-                evaluation_sets.append(EvaluationSet(set=split_ds, logging_mode=f'eval_{split_name}'))
-
-    # adding validation-mismatched subsets
-    if data_args.mismatched_indices_dir is not None:
-        for split_dir in data_args.mismatched_indices_dir:
-            splits = os.listdir(split_dir)
-            for split_file_name in splits:
-                if split_file_name.split(".")[-1] != "bin":
-                    continue
-                split_indices = torch.load(os.path.join(split_dir, split_file_name))
-                split_ds = raw_datasets['validation_mismatched'].select(split_indices)
-                split_name = extract_split_name(split_dir, split_file_name)
-                evaluation_sets.append(EvaluationSet(set=split_ds, logging_mode=f'eval_{split_name}'))
-
-    if data_args.synthetic_bias_prevalence > 0:
-        evaluation_sets.append(
-            EvaluationSet(set=raw_datasets['unbiased_validation_matched'], logging_mode='eval_unbiased', metrics_func=get_metrics_function(
-                False, data_args, None)))
-
-    if data_args.task_name == 'fever':
-        evaluation_sets.append(EvaluationSet(set=raw_datasets['fever_symmetric'], logging_mode='eval_FEVER_symmetric'))
-
-    if data_args.task_name == 'qqp':
-        evaluation_sets.append(EvaluationSet(set=raw_datasets['paws_test'], logging_mode='eval_PAWS'))
+    evaluation_sets = extract_evaluation_sets(data_args, eval_dataset, raw_datasets, wandb_args)
 
     trainer = build_trainer(
         bias_indices=biased_indices,
@@ -270,8 +238,7 @@ def main(outside_usage=False):
         tokenizer=tokenizer,
         train_dataset=train_dataset,
         training_args=training_args,
-        weak_model=weak_model,
-        model_init=model_init,
+        weak_models=weak_models,
         metrics_bias_indices=metrics_bias_indices,
         evaluation_sets=evaluation_sets
     )
@@ -315,16 +282,74 @@ def main(outside_usage=False):
         kwargs["dataset_args"] = data_args.task_name
         kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
 
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    elif training_args.create_model_card:
-        trainer.create_model_card(**kwargs)
+    if training_args.create_model_card:
+        try:
+            trainer.create_model_card(**kwargs)
+        except:
+            pass
 
     # Clear optimizer state files (optimizer.pt) to save disk space.
     from glob import glob
     for f in glob(f'{training_args.output_dir}/checkpoint-*/optimizer.pt'):
         logger.info(f"removing {f}")
         os.remove(f)
+
+
+def extract_evaluation_sets(data_args, eval_dataset, raw_datasets, wandb_args):
+    evaluation_sets: List[EvaluationSet] = []
+    if 'hans' in raw_datasets:
+        from metrics import hans_compute_metrics
+        hans_ds = raw_datasets['hans']
+        hans_mask = np.array(hans_ds['label']) == (0 if not data_args.old_labels_order else 1)
+        hans_ent = hans_ds.select(np.nonzero(hans_mask)[0])
+        from functools import partial
+        hans_metric = partial(hans_compute_metrics, old_labels_order=data_args.old_labels_order)
+        evaluation_sets.append(EvaluationSet(set=hans_ent, logging_mode='eval_HANS_ent', metrics_func=hans_metric))
+        hans_non_ent = hans_ds.select(np.nonzero(~hans_mask)[0])
+        evaluation_sets.append(
+            EvaluationSet(set=hans_non_ent, logging_mode='eval_HANS_non_ent', metrics_func=hans_metric))
+    # adding validation matched subsets
+    if data_args.indices_dir is not None:
+        for split_dir in data_args.indices_dir:
+            splits = os.listdir(split_dir)
+            for split_file_name in splits:
+                if split_file_name.split(".")[-1] != "bin":
+                    continue
+                split_indices = torch.load(os.path.join(split_dir, split_file_name))
+                split_ds = eval_dataset.select(split_indices)
+                split_name = extract_split_name(split_dir, split_file_name)
+                evaluation_sets.append(EvaluationSet(set=split_ds, logging_mode=f'eval_{split_name}'))
+
+    if data_args.task_name == "mnli" and wandb_args.tags is not None and (
+            'hypothesis_only_bias' in wandb_args.tags or 'unknown_bias' in wandb_args.tags):
+        if data_args.mismatched_indices_dir is None:
+            data_args.mismatched_indices_dir = []
+        if 'data/hypothesis_bias_splits/validation_mismatched' not in data_args.mismatched_indices_dir:
+            data_args.mismatched_indices_dir.append("data/hypothesis_bias_splits/validation_mismatched")
+
+    # adding validation-mismatched subsets
+    if data_args.mismatched_indices_dir is not None:
+        for split_dir in data_args.mismatched_indices_dir:
+            splits = os.listdir(split_dir)
+            for split_file_name in splits:
+                if split_file_name.split(".")[-1] != "bin":
+                    continue
+                split_indices = torch.load(os.path.join(split_dir, split_file_name))
+                split_ds = raw_datasets['validation_mismatched'].select(split_indices)
+                split_name = extract_split_name(split_dir, split_file_name)
+                evaluation_sets.append(EvaluationSet(set=split_ds, logging_mode=f'eval_{split_name}'))
+    if data_args.synthetic_bias_prevalence > 0:
+        evaluation_sets.append(
+            EvaluationSet(set=raw_datasets['unbiased_validation_matched'], logging_mode='eval_unbiased',
+                          metrics_func=get_metrics_function(
+                              False, data_args, None)))
+    if data_args.task_name == 'fever':
+        evaluation_sets.append(EvaluationSet(set=raw_datasets['fever_symmetric'], logging_mode='eval_FEVER_symmetric'))
+        evaluation_sets.append(
+            EvaluationSet(set=raw_datasets['fever_symmetric_v2'], logging_mode='eval_FEVER_symmetricV2'))
+    if data_args.task_name == 'qqp':
+        evaluation_sets.append(EvaluationSet(set=raw_datasets['paws_test'], logging_mode='eval_PAWS'))
+    return evaluation_sets
 
 
 def load_datasets(data_args, model_args, training_args):
@@ -334,27 +359,27 @@ def load_datasets(data_args, model_args, training_args):
     # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
     # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
     # label if at least two columns are provided.
-    #
-    # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
-    # single column. You can easily tweak this behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
 
     if data_args.task_name is not None:
         # Downloading and loading a dataset from the hub.
         if data_args.task_name == 'fever':
-            raw_datasets = load_dataset(path.join(DATA_DIR, 'fever/fever_nli.py'), cache_dir=model_args.cache_dir)
-            raw_datasets['fever_symmetric'] = load_dataset(path.join(DATA_DIR, 'fever/fever_symmetric.py'), cache_dir=model_args.cache_dir)[
-                'test'].cast_column('id', Value(dtype='int64', id=None))
+            raw_datasets = load_dataset(path.join(DATA_DIR, 'fever/fever_nli.py'), cache_dir=model_args.cache_dir,
+                                        trust_remote_code=True)
+            sym = load_dataset(path.join(DATA_DIR, 'fever/fever_symmetric.py'), cache_dir=model_args.cache_dir,
+                               trust_remote_code=True)
+            raw_datasets['fever_symmetric'] = sym['test'].cast_column('id', Value(dtype='int64', id=None))
+            raw_datasets['fever_symmetric_v2'] = sym['test_v2'].cast_column('id', Value(dtype='int64', id=None))
         else:
-            raw_datasets = load_dataset("glue", data_args.task_name, cache_dir=model_args.cache_dir)
+            raw_datasets = datasets.load_from_disk(path.join(DATA_DIR, "cached_glue", data_args.task_name))
+            # raw_datasets = load_dataset("glue", data_args.task_name, cache_dir=model_args.cache_dir)
             if data_args.task_name == "qqp":
-                paws = load_dataset('csv', data_files={'test': path.join(DATA_DIR, 'PAWS_QQP/dev_and_test.tsv')}, delimiter='\t')['test']
+                paws = load_dataset('csv', data_files={'test': path.join(DATA_DIR, 'PAWS_QQP/dev_and_test.tsv')},
+                                    delimiter='\t')['test']
                 paws = paws.rename_columns({'sentence1': 'question1', 'sentence2': 'question2'})
                 raw_datasets['paws_test'] = paws
-            elif data_args.task_name == 'mnli' and hasattr(training_args, 'evaluate_on_hans') and training_args.evaluate_on_hans:
-                raw_datasets['hans'] = load_dataset('hans')['validation']
+            elif data_args.task_name == 'mnli' and (training_args.do_train or training_args.evaluate_on_hans):
+                # beware of adding this in synthetic bias
+                raw_datasets['hans'] = datasets.load_from_disk(path.join(DATA_DIR, "cached_glue", "hans"))['validation']
 
     elif data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -388,46 +413,47 @@ def load_datasets(data_args, model_args, training_args):
         else:
             # Loading a dataset from local json files
             raw_datasets = load_dataset("json", data_files=data_files, cache_dir=model_args.cache_dir)
-    # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+
     return raw_datasets
 
 
 def build_trainer(bias_indices, data_args, data_collator, eval_dataset, is_regression, model, tokenizer,
-                  train_dataset, training_args, weak_model, model_init=None, metrics_bias_indices=None,
+                  train_dataset, training_args, weak_models, metrics_bias_indices=None,
                   evaluation_sets: List[EvaluationSet] = None) -> BaseTrainer:
     trainer_cls = BaseTrainer
     kwargs = {}
     special_trainer = {
-        'missclassification_only': MisclassificationTrainer,
-        'topk_loss_trainer': TopKLossTrainer,
+        # 'missclassification_only': MisclassificationTrainer,
+        # 'topk_loss_trainer': TopKLossTrainer,
         'POE': PoETrainer,
         'conf_reg': ConfRegTrainer,
     }
     if training_args.regularization_method is not None:
         if training_args.regularization_method in special_trainer.keys():
             trainer_cls = special_trainer[training_args.regularization_method]
-        elif training_args.self_regularization:
-            trainer_cls = selfReg
-            # no weak model
         else:
-            trainer_cls = BaseGradRegTrainer if training_args.regularize_grads else SimRegTrainer
-    if weak_model is not None:
-        kwargs.update({'weak_model': weak_model})
+            if training_args.regularize_grads:
+                raise Exception("Error: Deprecated")
+                # from grad_reg_trainer import BaseGradRegTrainer
+                # trainer_cls = BaseGradRegTrainer
+            else:
+                trainer_cls = SimRegTrainer
+    if weak_models is not None:
+        kwargs.update({'weak_models': weak_models})
 
-    if training_args.regularization_method == 'conf_reg':
+    if training_args.regularization_method in ['conf_reg', 'POE']:
         kwargs.update({'columns_to_keep': ['idx', 'id']})
 
     if training_args.regularize_only_biased:
         kwargs.update({'columns_to_keep': ['idx', 'id'], 'bias_indices': bias_indices})
 
     if training_args.separate_weak_tokenization:
-        if 'columns_to_keep' in kwargs:
-            kwargs['columns_to_keep'].append('weak_input_ids')
-            kwargs['columns_to_keep'].append('weak_attention_mask')
-            kwargs['columns_to_keep'].append('weak_token_type_ids')
-        else:
-            kwargs.update({'columns_to_keep': ['weak_input_ids', 'weak_attention_mask', 'weak_token_type_ids']})
+        if 'columns_to_keep' not in kwargs:
+            kwargs['columns_to_keep'] = []
+        for fw_idx in range(len(weak_models)):
+            kwargs['columns_to_keep'].append(f'weak_{fw_idx}_input_ids')
+            kwargs['columns_to_keep'].append(f'weak_{fw_idx}_attention_mask')
+            kwargs['columns_to_keep'].append(f'weak_{fw_idx}_token_type_ids')
 
     trainer = trainer_cls(
         model=model,
@@ -437,7 +463,6 @@ def build_trainer(bias_indices, data_args, data_collator, eval_dataset, is_regre
         compute_metrics=get_metrics_function(is_regression, data_args, synthetic_bias_indices=metrics_bias_indices),
         tokenizer=tokenizer,
         data_collator=data_collator,
-        model_init=model_init,
         evaluation_sets=evaluation_sets,
         **kwargs
     )
@@ -446,7 +471,8 @@ def build_trainer(bias_indices, data_args, data_collator, eval_dataset, is_regre
     return trainer
 
 
-def setup_args(additional_args: Tuple[Any] = ()) -> Tuple[DataTrainingArguments, Any, ModelArguments, TrainingArguments, Any]:
+def setup_args(additional_args: Tuple[Any] = ()) -> Tuple[
+    DataTrainingArguments, Any, ModelArguments, TrainingArguments, Any]:
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
@@ -490,7 +516,8 @@ def setup_args(additional_args: Tuple[Any] = ()) -> Tuple[DataTrainingArguments,
 
 
 # using wrapper to save the context
-def get_preprocess_function(tokenizer, sentence1_key, sentence2_key, max_seq_length, padding, label_to_id=None, weak_tokenizer=None):
+def get_preprocess_function(tokenizer, sentence1_key, sentence2_key, max_seq_length, padding, label_to_id=None,
+                            weak_tokenizers=None):
     def preprocess_function(examples):
         if sentence1_key is None:
             args = ((examples[sentence2_key],))
@@ -500,10 +527,11 @@ def get_preprocess_function(tokenizer, sentence1_key, sentence2_key, max_seq_len
             args = ((examples[sentence1_key], examples[sentence2_key]))
 
         result = tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
-        if weak_tokenizer is not None:
-            weak_encoding = weak_tokenizer(*args, padding=padding, max_length=max_seq_length, truncation=True)
-            for k in weak_encoding:
-                result[f'weak_{k}'] = weak_encoding[k]
+        if weak_tokenizers is not None and len(weak_tokenizers) > 0:
+            for model_idx, wt in enumerate(weak_tokenizers):
+                weak_encoding = wt(*args, padding='max_length', max_length=max_seq_length, truncation=True)
+                for k in weak_encoding:
+                    result[f'weak_{model_idx}_{k}'] = weak_encoding[k]
 
         # Map labels to IDs (not necessary for GLUE tasks)
         if label_to_id is not None and "label" in examples:
@@ -513,8 +541,10 @@ def get_preprocess_function(tokenizer, sentence1_key, sentence2_key, max_seq_len
     return preprocess_function
 
 
-def preprocess_raw_datasets(data_args: DataTrainingArguments, raw_datasets: DatasetDict, context_manager, sentence1_key: str,
-                            training_args: TrainingArguments, num_labels: int = 3, lexical_bias_settings: bool = False, preprocessing_func=None) \
+def preprocess_raw_datasets(data_args: DataTrainingArguments, raw_datasets: DatasetDict, context_manager,
+                            sentence1_key: str,
+                            training_args: TrainingArguments, num_labels: int = 3, lexical_bias_settings: bool = False,
+                            preprocessing_func=None) \
         -> Tuple[Optional[torch.Tensor], DatasetDict]:
     """
         Tokenize / Synthesize bias / load processed cached dataset
@@ -522,7 +552,8 @@ def preprocess_raw_datasets(data_args: DataTrainingArguments, raw_datasets: Data
     if lexical_bias_settings:
         # Load cached pre-processed dataset
         # pre-processing is done earlier for lexical features.
-        if training_args.separate_weak_tokenization:
+        if training_args.separate_weak_tokenization and data_args.task_name == 'mnli':
+            # DeBERTa case
             lex_dataset = load_from_disk(path.join(DATA_DIR, 'padded_mnli_with_hans_lexical_features'))
             old_columns = lex_dataset['train'].column_names
             columns_mapping = {}
@@ -530,30 +561,34 @@ def preprocess_raw_datasets(data_args: DataTrainingArguments, raw_datasets: Data
                 if old_column == 'id':
                     continue
                 columns_mapping[old_column] = "weak_" + old_column
-            lex_dataset = DatasetDict({k: dataset.rename_columns(column_mapping=columns_mapping) for k, dataset in lex_dataset.items()})
+            lex_dataset = DatasetDict(
+                {k: dataset.rename_columns(column_mapping=columns_mapping) for k, dataset in lex_dataset.items()})
             for split in raw_datasets.keys():
                 if split in lex_dataset:
                     raw_datasets[split] = concatenate_datasets([raw_datasets[split], lex_dataset[split]], axis=1)
         else:
-            if data_args.task_name == 'qqp':
-                qqp_lex = datasets.load_from_disk(path.join(DATA_DIR, 'QQP_clark_lex'))
-                # TODO: add lexical test set.
-                raw_datasets.pop('test')
-                qqp_lex = qqp_lex.remove_columns('label')
-                for split in raw_datasets.keys():
-                    if split in qqp_lex:
-                        raw_datasets[split] = concatenate_datasets([raw_datasets[split], qqp_lex[split]], axis=1)
-            else:
-                raw_datasets = raw_datasets.map(None, cache_file_names=lexical_bias_cache_mapper[data_args.task_name])
-                return None, raw_datasets
+            mapper = {
+                'mnli': 'MNLI_HANS_Clark',
+                'qqp': 'QQP_clark_lex'
+            }
+            if data_args.old_lexical_settings:
+                mapper['mnli'] = 'padded_mnli_with_hans_lexical_features'
+
+            lex_ds = datasets.load_from_disk(path.join(DATA_DIR, mapper[data_args.task_name]))
+            if preprocessing_func is None:
+                return None, lex_ds
+            lex_ds = lex_ds.remove_columns('label')
+            for split in raw_datasets.keys():
+                if split in lex_ds:
+                    raw_datasets[split] = concatenate_datasets([raw_datasets[split], lex_ds[split]], axis=1)
 
     def synthesize_bias(ds_name, ds_object):
         logging.info(f'synthesizing bias for {ds_name}')
         # indices of samples to be injected with bias tokens
-        biased_indices = np.random.choice(
-            len(ds_object['label']),
-            int(data_args.synthetic_bias_prevalence * len(ds_object['label'])),
-            replace=False)
+        biased_indices = np.random.choice(len(ds_object['label']),
+                                          int(data_args.synthetic_bias_prevalence * len(ds_object['label'])),
+                                          replace=False)
+
         aligned_samples_num = int(data_args.bias_correlation_prob * len(biased_indices))
         aligned_indices = biased_indices[:aligned_samples_num]
         misaligned_indices = biased_indices[aligned_samples_num:]
@@ -637,10 +672,12 @@ def get_datasets(data_args, raw_datasets, training_args, tokenizer: PreTrainedTo
             logger.info(f"Train len: {len(train_dataset)}")
         elif data_args.select_only_biased_samples:
             train_dataset = train_dataset.select(biased_samples)
-            logger.info(f"Restricting train to biased samples provided by bias_indices argument, Train len: {len(train_dataset)}")
+            logger.info(
+                f"Restricting train to biased samples provided by bias_indices argument, Train len: {len(train_dataset)}")
 
         if data_args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(data_args.max_train_samples))
+            logger.info(f"Subseting training dataset to len({data_args.max_train_samples})")
+            train_dataset = train_dataset.select(torch.randperm(len(train_dataset))[:data_args.max_train_samples])
 
     if training_args.do_eval:
         if "validation" not in raw_datasets and "validation_matched" not in raw_datasets:
@@ -650,7 +687,8 @@ def get_datasets(data_args, raw_datasets, training_args, tokenizer: PreTrainedTo
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
     # currently, FEVER does not have a test set.
     if training_args.do_predict or (
-            data_args.task_name is not None and data_args.task_name not in ['fever', 'qqp']) or data_args.test_file is not None:
+            data_args.task_name is not None and data_args.task_name not in [
+        'fever']) or data_args.test_file is not None:
         if "test" not in raw_datasets and "test_matched" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
         predict_dataset = raw_datasets["test_matched" if data_args.task_name == "mnli" else "test"]
@@ -721,30 +759,29 @@ def setup_logging(training_args):
     logger.info(f"Training/evaluation parameters {training_args}")
 
 
-def load_models(data_args: DataTrainingArguments, model_args: ModelArguments, training_args: TrainingArguments, num_labels: int = 3) -> Tuple[
-    AutoConfig, AutoModelForSequenceClassification, PreTrainedTokenizer, Optional[AutoModelForSequenceClassification], Optional[
-        PreTrainedTokenizer], bool]:
+def load_models(data_args: DataTrainingArguments, model_args: ModelArguments, training_args: TrainingArguments,
+                num_labels: int = 3) -> Tuple[
+    AutoConfig, AutoModelForSequenceClassification, PreTrainedTokenizer, List[AutoModelForSequenceClassification],
+    Optional[
+        List[PreTrainedTokenizer]], bool]:
     # Load pretrained model and tokenizer
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    # TODO: This code only support instantiating Bert models.
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-    )
-    config_kwargs = {}
     if data_args.lexical_bias_model:
-        config_cls = BertWithLexicalBiasConfig
-        if data_args.task_name == 'qqp':
-            config_cls = ClarkLexicalBiasConfig
+        config_cls = BertWithLexicalBiasConfig if data_args.old_lexical_settings else ClarkLexicalBiasConfig
     else:
         config_cls = AutoConfig
+    if path.isfile(path.join(model_args.model_name_or_path, "config.json")):
+        with open(path.join(model_args.model_name_or_path, "config.json"), 'r') as fp:
+            config = json.load(fp)
+            config_mapper = {
+                'ClarkLexicalBiasModel': ClarkLexicalBiasConfig,
+                'BOW': BaselineConfig
+            }
+            if 'architectures' in config and config['architectures'][0] in config_mapper.keys():
+                config_cls = config_mapper[config['architectures'][0]]
 
-    lexical_bias_settings = False
+    if model_args.model_name_or_path.lower() == 'bow' or os.path.exists(
+            os.path.join(model_args.model_name_or_path, 'class.txt')):
+        config_cls = BaselineConfig
 
     config = config_cls.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
@@ -752,29 +789,64 @@ def load_models(data_args: DataTrainingArguments, model_args: ModelArguments, tr
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-        **config_kwargs
+        use_auth_token=True if model_args.use_auth_token else None
     )
-    weak_tokenizer = None
-    if training_args.weak_model_path:
-        weak_model_config = AutoConfig.from_pretrained(training_args.weak_model_path, num_labels=num_labels, finetuning_task=data_args.task_name)
+    if not data_args.lexical_bias_model and config_cls != ClarkLexicalBiasConfig:
+        tokenizer_args = {}
+        tokenizer_cls = AutoTokenizer
+        if config_cls == BaselineConfig:
+            tokenizer_args.update({'vocab_file': config.vocab_file, 'do_lower_case': False})
+            tokenizer_cls = BaselineTokenizer
+
+        tokenizer = tokenizer_cls.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            use_auth_token=True if model_args.use_auth_token else None,
+            **tokenizer_args
+        )
+    else:
+        tokenizer = None
+
+    lexical_bias_settings = False
+    weak_models = []
+    weak_tokenizers = []
+    for fw_path in training_args.weak_models_path:
+        if os.path.exists(os.path.join(fw_path, 'class.txt')):
+            config_cls = BaselineConfig
+        else:
+            config_cls = AutoConfig
+
+        weak_model_config = config_cls.from_pretrained(fw_path, num_labels=num_labels,
+                                                       finetuning_task=data_args.task_name)
 
         if is_partial_input_model(weak_model_config):
+            from models import PartialInputBert
             model_cls = PartialInputBert
-        elif weak_model_config.architectures is not None and 'BertWithLexicalBiasModel' in weak_model_config.architectures:
-            model_cls = BertWithLexicalBiasModel
-            lexical_bias_settings = True
-        elif weak_model_config.architectures is not None and 'ClarkLexicalBiasModel' in weak_model_config.architectures:
-            model_cls = ClarkLexicalBiasModel
-            lexical_bias_settings = True
+        elif weak_model_config.architectures is not None:
+            if 'BertWithLexicalBiasModel' in weak_model_config.architectures:
+                model_cls = BertWithLexicalBiasModel
+                lexical_bias_settings = True
+            elif 'ClarkLexicalBiasModel' in weak_model_config.architectures:
+                model_cls = ClarkLexicalBiasModel
+                lexical_bias_settings = True
+            elif 'BOW' in weak_model_config.architectures:
+                model_cls = BaselineModel
+            else:
+                model_cls = AutoModelForSequenceClassification
         else:
             model_cls = AutoModelForSequenceClassification
 
-        weak_model = model_cls.from_pretrained(training_args.weak_model_path, config=weak_model_config)
-        weak_tokenizer = AutoTokenizer.from_pretrained(training_args.weak_model_path)
-        weak_model.to(training_args.device)
-    else:
-        weak_model = None
+        weak_models.append(model_cls.from_pretrained(fw_path, config=weak_model_config).to(training_args.device))
+        tokenizer_args = {}
+        tokenizer_cls = AutoTokenizer
+        if model_cls == BaselineModel:
+            tokenizer_args.update(
+                {'vocab_file': weak_model_config.vocab_file, 'do_lower_case': weak_model_config.do_lower_case})
+            tokenizer_cls = BaselineTokenizer
+
+        weak_tokenizers.append(tokenizer_cls.from_pretrained(fw_path) if model_cls != ClarkLexicalBiasModel else None)
 
     if data_args.hypothesis_only:
         config.hypothesis_only = True
@@ -782,26 +854,39 @@ def load_models(data_args: DataTrainingArguments, model_args: ModelArguments, tr
         config.claim_only = True
 
     if is_partial_input_model(config):
+        from models import PartialInputBert
         model_cls = PartialInputBert
-    elif data_args.lexical_bias_model or (config.architectures is not None and (
-            'BertWithLexicalBiasModel' in config.architectures or 'ClarkLexicalBiasModel' in config.architectures)):
+    elif config.architectures is not None and 'BertWithLexicalBiasModel' in config.architectures:
         model_cls = BertWithLexicalBiasModel
-        if data_args.task_name == 'qqp':
-            model_cls = ClarkLexicalBiasModel
-        lexical_bias_settings = True
+    elif config.architectures is not None and 'ClarkLexicalBiasModel' in config.architectures:
+        model_cls = ClarkLexicalBiasModel
+    elif data_args.lexical_bias_model and data_args.old_lexical_settings:
+        model_cls = BertWithLexicalBiasModel
+    elif data_args.lexical_bias_model and not data_args.old_lexical_settings:
+        model_cls = ClarkLexicalBiasModel
+    elif config_cls == BaselineConfig:
+        model_cls = BaselineModel
     else:
         model_cls = AutoModelForSequenceClassification
 
-    model = model_cls.from_pretrained(
+    if model_cls in (ClarkLexicalBiasModel, BertWithLexicalBiasModel):
+        lexical_bias_settings = True
+
+    model, loading_info = model_cls.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        output_loading_info=True
     )
+
+    logger.info(loading_info)
+
     if lexical_bias_settings:
         assert not training_args.remove_unused_columns
+
     if model_args.randomly_initialize_model:
         logger.info("Initializing weights of main model randomly!")
         model.init_weights()
@@ -811,8 +896,12 @@ def load_models(data_args: DataTrainingArguments, model_args: ModelArguments, tr
     if model_args.freeze_encoder:
         logger.info("Freezing encoder!")
         model.bert.requires_grad_(False)
+        if model_args.new_clf_head:
+            logger.info("Initializing classifier")
+            model.classifier.apply(model._init_weights)
 
-    return config, model, tokenizer, weak_model, weak_tokenizer, lexical_bias_settings
+    return config, model, tokenizer, weak_models if len(
+        weak_models) > 0 else None, weak_tokenizers, lexical_bias_settings
 
 
 def do_eval(
@@ -867,11 +956,6 @@ def do_predict(data_args, is_regression, label_list, predict_dataset, raw_datase
                     else:
                         item = label_list[item]
                         writer.write(f"{index}\t{item}\n")
-
-
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
+
 # Installation
 This work is built on HuggingFace's transformers library. To run the code you need to install this library to your local
-environment using the following command.  
+environment using the following command (preferably in a new environment, since it will override current version of transformers).
 
 ```python setup.py install```
 
@@ -84,7 +85,7 @@ cd examples/pytorch/text-classification/
 guidance_model_dir=""
 regularized_layers="bert.embeddings bert.encoder.layer.0 bert.encoder.layer.6 bert.encoder.layer.10 bert.encoder.layer.11"
 batch_size=64
-lambda=10
+lambda=100
 model_name=bert_EDBXE_linear_cka_eM-0M-6M-10M-11M_e-0-6-10-11_lambda_${lambda}_${batch_size}_sim
 mnli_SPLIT_PATH="${SPLITS_DIR}/mnli_hypothesis_bias_splits/train_biased_correct_indices.bin"
 

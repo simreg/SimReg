@@ -692,22 +692,23 @@ class TrainingArguments:
 
     regularized_layers: Optional[List[str]] = field(default=None, metadata={'help': 'layers to regularize in the main model'})
     regularized_tokens: Optional[List[str]] = field(default=None,
-                                                    metadata={'help': 'whether to regularize only CLS token or all tokens options:(CLS/all)'})
+                                                    metadata={'help': 'whether to regularize only CLS token or all tokens options:(CLS/all/ none)'})
     token_aggregation_strategy: List[AggregationStrategy] = field(default=None, metadata={'help': 'method of aggregation the '
                                                                                                   'representations in each layer mean/sum/seperate'})
 
-    regularization_lambda: float = field(default=1.0, metadata={'help': 'Lambda factor in regularization term'})
+    regularization_lambda: Optional[float] = field(default=None,
+                                                         metadata={'help': 'Lambda factor in regularization term'})
     main_task_lambda: float = field(default=1.0, metadata={'help': 'Lambda factor in main task loss term(e.g. MNLI)'})
     regularize_grads: bool = field(default=False, metadata={'help': 'use gradient regularization'})
     enforce_similarity: bool = field(default=False, metadata={'help': 'enforce similarity instead of dissimilarity'})
-    weak_model_path: str = field(
+    weak_models_path: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Path to the weak model"},
+        metadata={"help": "list of paths to the guidance models"},
     )
 
-    weak_model_layers: Optional[List[str]] = field(
+    weak_models_layers: Optional[List[str]] = field(
         default=None,
-        metadata={'help': 'The layers which to compare the it\'s activations to the main model'}
+        metadata={'help': 'The layers which to compare the it\'s activations to the main model, models are separated by :'}
     )
 
     evaluate_on_hans: bool = field(default=False, metadata={'help': 'Evaluate on HANS during training'})
@@ -750,8 +751,6 @@ class TrainingArguments:
 
         if self.disable_tqdm is None:
             self.disable_tqdm = logger.getEffectiveLevel() > logging.WARN
-        # EDIT
-        self.self_regularization = self.regularization_method in ('cosine_self', 'l2_self', 'entropy_reg')
 
         if isinstance(self.evaluation_strategy, EvaluationStrategy):
             warnings.warn(
@@ -775,6 +774,22 @@ class TrainingArguments:
             self.regularized_tokens *= len(self.regularized_layers)
 
         self.bias_sampling_strategy = BiasSamplingStrategy(self.bias_sampling_strategy)
+
+        if self.weak_models_path is None:
+            self.weak_models_path = []
+
+        if self.weak_models_layers is not None:
+            separated_weak_models_layers = []
+            current_model_layers = []
+            for l in self.weak_models_layers:
+                if l == ':':
+                    separated_weak_models_layers.append(current_model_layers)
+                    current_model_layers = []
+                else:
+                    current_model_layers.append(l)
+            separated_weak_models_layers.append(current_model_layers)
+            self.weak_models_layers: Optional[List[List[str]]] = separated_weak_models_layers
+
 
         self.lr_scheduler_type = SchedulerType(self.lr_scheduler_type)
         if self.do_eval is False and self.evaluation_strategy != IntervalStrategy.NO:

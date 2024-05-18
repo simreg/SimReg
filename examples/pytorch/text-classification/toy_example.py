@@ -69,6 +69,7 @@ def main():
     trainer = build_trainer(None, data_args, default_data_collator, eval_dataset, None, model, None, train_dataset, training_args, weak_model)
     if training_args.regularization_method is not None:
         mean_callback = ParamMeanWatch()
+        # Brook it to clean the code, check in the git history if you want to re-run it.
         mean_callback.hist_ref = trainer.param_mean_hist
         mean_callback.tokens_sim_hist = trainer.tokens_sim_hist
         trainer.add_callback(mean_callback)

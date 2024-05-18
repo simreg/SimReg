@@ -1,23 +1,20 @@
 import inspect
 import logging
+from collections.abc import Mapping
 from typing import Dict, List, Optional
 
 import datasets
 import torch.nn.modules.module
 from torch.utils.data import DataLoader
-from transformers import Trainer, TrainingArguments, is_datasets_available
+from transformers.trainer import Trainer
+from transformers import TrainingArguments, is_datasets_available
 from torch.nn.functional import normalize
 from transformers.pipelines.base import Dataset
 from transformers.trainer_utils import AggregationStrategy, BiasSamplingStrategy
-import numpy as np
-import os.path
 
 from models.lexical_bias_bert import ClarkLexicalBiasModel
 from utils.bias_sampler import BiasBatchSampler
 from models import BertWithLexicalBiasModel
-from utils.similarity_utils import pwcca_distance_choose_best_layer_matrix, orthogonal_procrustes_distance
-from torch.nn import DataParallel, KLDivLoss
-from torch.nn.functional import log_softmax
 from utils.misc import EvaluationSet
 
 
@@ -38,8 +35,6 @@ def off_diag_mean(input_tensor):
 
 
 def get_model_signature(model):
-    if isinstance(model, DataParallel):
-        model = model.module
     return inspect.signature(model.forward).parameters.keys()
 
 
@@ -49,8 +44,8 @@ class BaseTrainer(Trainer):
         self.logging_mode = 'train'
         self.xe_loss_log = {'train': [], 'eval': []}
         self.evaluation_sets = evaluation_sets if evaluation_sets is not None else []
-        self.param_mean_hist = {}
         self.tokens_sim_hist = {}
+        assert self.args.n_gpu == 1, "This code have not been tested on multi-GPU settings."
 
     def evaluate(
             self,
@@ -123,11 +118,6 @@ class BaseTrainer(Trainer):
                 self.sim_hist[self.logging_mode][k].clear()
 
         if self.logging_mode == 'train':
-            for c, c_hist in self.param_mean_hist.items():
-                if len(c_hist) == 0:
-                    continue
-                logs[f'{c}_norm'] = sum(c_hist) / len(c_hist)
-                self.param_mean_hist[c] = []
             for k, hist in self.tokens_sim_hist.items():
                 if len(hist) == 0:
                     continue
@@ -141,14 +131,37 @@ class BaseTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         loss = super(BaseTrainer, self).compute_loss(model=model, inputs=inputs, return_outputs=return_outputs)
         self.log_loss(loss[0] if isinstance(loss, tuple) else loss)
+        if self.args.main_task_lambda != 1.0 and self.logging_mode == "train":
+            if isinstance(loss, tuple):
+                loss = (loss[0] * self.args.main_task_lambda,) + loss[1:]
+            else:
+                loss = loss * self.args.main_task_lambda
         return loss
+
+    def _prepare_input(self, data):
+        """
+        Prepares one :obj:`data` before feeding it to the model, be it a tensor or a nested list/dictionary of tensors.
+        """
+        if isinstance(data, Mapping):
+            return type(data)({k: self._prepare_input(v) for k, v in data.items()})
+        elif isinstance(data, (tuple, list)):
+            return type(data)(self._prepare_input(v) for v in data)
+        elif isinstance(data, torch.Tensor):
+            kwargs = dict(device=self.args.device)
+            if self.deepspeed and data.dtype != torch.int64:
+                # NLP models inputs are int64 and those get adjusted to the right dtype of the
+                # embedding. Other models such as wav2vec2's inputs are already float and thus
+                # may need special handling to match the dtypes of the model
+                kwargs.update(dict(dtype=self.args.hf_deepspeed_config.dtype()))
+            return data.to(**kwargs)
+        return data
 
 
 class SimRegTrainer(BaseTrainer):
     def __init__(
             self,
             model,
-            weak_model=None,
+            weak_models=None,
             bias_indices=None,
             args: TrainingArguments = None,
             **kwargs
@@ -157,26 +170,24 @@ class SimRegTrainer(BaseTrainer):
         self.bias_sampler: BiasBatchSampler = None
         self.sim_hist = dict()
         self.regularized_layers = args.regularized_layers
-        self.weak_model = weak_model
-        self.weak_model_layers = args.weak_model_layers
+        self.weak_models = weak_models
+        self.weak_models_layers = args.weak_models_layers
         # assert args.regularized_layers is not None and len(args.regularized_layers) == len(args.weak_model_layers)
         # initialized to empty lists to ensure passing them by-reference.
         self.activations = [None] * len(self.regularized_layers)
-        self.weak_activations = [None] * len(self.regularized_layers)
+        self.weak_activations = [[None] * len(fw_layers) for fw_layers in self.weak_models_layers]
         self.reg_lambda = args.regularization_lambda
-        if self.args.n_gpu > 1:
-            logging.error('This code have not been tested on multi-GPU settings.')
 
-        self.activations_hook_init = model is None
+        # hook layers
+        assert model is not None
         if model is not None:
             for i in range(len(self.regularized_layers)):
                 model.get_submodule(self.regularized_layers[i]).register_forward_hook(get_activation(self.activations, i))
             self.main_signature = set(get_model_signature(model))
-
-        if weak_model is not None:
-            for i in range(len(self.weak_model_layers)):
-                weak_model.get_submodule(self.weak_model_layers[i]).register_forward_hook(get_activation(self.weak_activations, i))
-            self.weak_signature = set(get_model_signature(weak_model))
+        if weak_models is not None:
+            for fw_idx, fw in enumerate(weak_models):
+                for i in range(len(self.weak_models_layers[fw_idx])):
+                    fw.get_submodule(self.weak_models_layers[fw_idx][i]).register_forward_hook(get_activation(self.weak_activations[fw_idx], i))
 
         self.reg_loss_log = {'train': [], 'eval': []}
         if self.args.regularize_only_biased:
@@ -215,43 +226,47 @@ class SimRegTrainer(BaseTrainer):
         else:
             labels = None
 
-        optimize_sim_loss = self.args.regularization_delay <= self.state.global_step
         batch_bias_indices = None
 
-        if self.bias_sampler is None and self.args.regularize_only_biased and "idx" in inputs and self.logging_mode == 'train' and \
-                self.bias_indices is not None:
+        if self.bias_sampler is None and self.args.regularize_only_biased and self.logging_mode == 'train':
+            assert "idx" in inputs
+            assert self.bias_indices is not None
+            from numpy import intersect1d
             indices = inputs.pop('idx').cpu().numpy()
-            _, batch_bias_indices, _ = np.intersect1d(indices, self.bias_indices, return_indices=True, assume_unique=True)
-            batch_bias_indices = torch.tensor(batch_bias_indices, device=self.model.device)
+            _, batch_bias_indices, _ = intersect1d(indices, self.bias_indices, return_indices=True, assume_unique=True)
+            batch_bias_indices = torch.from_numpy(batch_bias_indices)
 
         if "idx" in inputs:
             inputs.pop('idx')
         if 'id' in inputs:
             inputs.pop('id')
 
-        if self.activations_hook_init:
-            logging.info(f'activations_hook activated at {os.getpid()}')
-            if isinstance(model, DataParallel):
-                raise NotImplementedError('Activations hook is not supported on multi-GPU yet.')
-            for i in range(len(self.regularized_layers)):
-                self.model.get_submodule(self.regularized_layers[i]).register_forward_hook(get_activation(self.activations, i))
-            self.main_signature = set(get_model_signature(self.model))
-            self.activations_hook_init = False
+        # if self.activations_hook_init:
+        #     logging.info(f'activations_hook activated at {os.getpid()}')
+        #     if isinstance(model, DataParallel):
+        #         raise NotImplementedError('Activations hook is not supported on multi-GPU yet.')
+        #     for i in range(len(self.regularized_layers)):
+        #         self.model.get_submodule(self.regularized_layers[i]).register_forward_hook(get_activation(self.activations, i))
+        #     self.main_signature = set(get_model_signature(self.model))
+        #     self.activations_hook_init = False
 
         main_inputs = {k: inputs[k] for k in self.main_signature.intersection(inputs.keys())}
         outputs = model(**main_inputs)
 
-        # calculate weak_model activations, TODO: Maybe replace it with a saved activations, or even save the similarity structures (RSM)?
-        if self.weak_model is not None:
+        # calculate weak_model activations
+        # TODO: Maybe replace it with a saved activations, or even save the similarity structures (RSM)?
+        if self.weak_models is not None:
             with torch.no_grad():
                 if self.args.separate_weak_tokenization:
-                    weak_inputs = dict()
-                    for k in inputs:
-                        if k.startswith("weak_"):
-                            weak_inputs[k[len("weak_"):]] = inputs[k]
-                    self.weak_model(**weak_inputs)
+                    for fw_idx, fw in enumerate(self.weak_models):
+                        weak_inputs = dict()
+                        for k in inputs:
+                            if k.startswith(f"weak_{fw_idx}_"):
+                                weak_inputs[k[len(f"weak_{fw_idx}_"):]] = inputs[k]
+                        fw(**weak_inputs)
                 else:
-                    self.weak_model(**inputs)
+                    for fw in self.weak_models:
+                        fw(**inputs)
 
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -266,59 +281,60 @@ class SimRegTrainer(BaseTrainer):
 
         if self.logging_mode == 'train' and self.bias_sampler is not None and not self.bias_sampler.bias_turn:
             sim_loss = None
-        elif optimize_sim_loss:
-            sim_loss = self.compute_sim_loss(inputs, indices=batch_bias_indices)
         else:
-            with torch.no_grad():
-                sim_loss = self.compute_sim_loss(inputs, indices=batch_bias_indices).detach()
+            sim_loss = self.compute_sim_loss(inputs, indices=batch_bias_indices)
 
         self.log_loss(loss, sim_loss)
+
+        if self.args.main_task_lambda != 1.0 and self.logging_mode == "train":
+            if isinstance(loss, tuple):
+                loss = (loss[0] * self.args.main_task_lambda,) + loss[1:]
+            else:
+                loss = loss * self.args.main_task_lambda
+
         if sim_loss is not None:
             if self.args.enforce_similarity:
-                # maximizing similarity instead of minimizing
-                sim_loss *= -1
-
-            # TODO: replace hard-coded param
-            if self.args.sim_multi_step_opt and self.is_in_train and self.logging_mode == 'train' and self.state.global_step % 4 != 0:
-                loss = self.reg_lambda * sim_loss
+                # maximize similarity instead of minimizing
+                loss -= self.reg_lambda * sim_loss
             else:
-                loss = self.args.main_task_lambda * loss + self.reg_lambda * sim_loss
+                loss += self.reg_lambda * sim_loss
 
         return (loss, outputs) if return_outputs else loss
 
     def compute_sim_loss(self, inputs, indices=None):
-        # prevent computing similarity for batch of size 1.
-        if len(inputs) == 1:
-            return None
+        assert len(inputs) > 1
 
         sim_loss = None
         for i in range(len(self.activations)):
-            weak_activations = self.weak_activations[i]
             main_activations = self.activations[i]
             main_activations, updated_indices = self.extract_relevant_activations(
                 inputs['attention_mask'],
                 main_activations,
                 batch_bias_indices=indices,
                 regularized_tokens=self.args.regularized_tokens[i],
-                aggregation_strategy=self.args.token_aggregation_strategy[i]
+                aggregation_strategy=self.args.token_aggregation_strategy[i] if self.args.token_aggregation_strategy is not None else None
             )
-            if not (isinstance(self.weak_model, BertWithLexicalBiasModel) or isinstance(self.weak_model, ClarkLexicalBiasModel)):
-                weak_activations, _ = self.extract_relevant_activations(
-                    inputs['weak_attention_mask'] if self.args.separate_weak_tokenization else inputs['attention_mask'],
-                    weak_activations,
-                    batch_bias_indices=indices,
-                    regularized_tokens=self.args.regularized_tokens[i],
-                    aggregation_strategy=self.args.token_aggregation_strategy[i]
-                )
+            for fw_idx, fw in enumerate(self.weak_models):
+                weak_activations = self.weak_activations[fw_idx][i]
+                if not (isinstance(fw, BertWithLexicalBiasModel) or isinstance(fw, ClarkLexicalBiasModel)):
+                    weak_activations, _ = self.extract_relevant_activations(
+                        inputs[f'weak_{fw_idx}_attention_mask'] if self.args.separate_weak_tokenization else inputs['attention_mask'],
+                        weak_activations,
+                        batch_bias_indices=indices,
+                        regularized_tokens=self.args.regularized_tokens[i],
+                        aggregation_strategy=self.args.token_aggregation_strategy[i] if self.args.token_aggregation_strategy is not None else None
+                    )
 
-            tmp_sm_ls = self.generic_sim_measure(main_activations, weak_activations, updated_indices, attention_mask=inputs.get('attention_mask', None))
-            if self.logging_mode not in self.sim_hist:
-                self.sim_hist[self.logging_mode] = {f"{k}_{v}": [] for k, v in zip(self.regularized_layers, self.weak_model_layers)}
-            self.sim_hist[self.logging_mode][f"{self.regularized_layers[i]}_{self.weak_model_layers[i]}"].append(tmp_sm_ls.item())
-            if sim_loss is None:
-                sim_loss = tmp_sm_ls
-            else:
-                sim_loss = sim_loss + tmp_sm_ls
+                tmp_sm_ls = self.generic_sim_measure(main_activations, weak_activations, updated_indices, attention_mask=inputs.get('attention_mask', None))
+                if self.logging_mode not in self.sim_hist:
+                    self.sim_hist[self.logging_mode] = {}
+                    for c in range(len(self.weak_models)):
+                        self.sim_hist[self.logging_mode].update({f"fw_{c}_{k}_{v}": [] for k, v in zip(self.regularized_layers, self.weak_models_layers[c])})
+                self.sim_hist[self.logging_mode][f"fw_{fw_idx}_{self.regularized_layers[i]}_{self.weak_models_layers[fw_idx][i]}"].append(tmp_sm_ls.item())
+                if sim_loss is None:
+                    sim_loss = tmp_sm_ls
+                else:
+                    sim_loss = sim_loss + tmp_sm_ls
 
         return sim_loss
 
@@ -330,7 +346,9 @@ class SimRegTrainer(BaseTrainer):
             return main_activations[:, 0, :], batch_bias_indices
         if regularized_tokens == 'all':
             # dimensions are: batch_size, n_tokens, hidden_dim
-            assert main_activations.dim() == 3
+            if main_activations.dim() != 3:
+                # dirty work around, that should be fixed!
+                return main_activations, batch_bias_indices
             mask = attention_mask.bool()
             if aggregation_strategy == AggregationStrategy.SUM or \
                     aggregation_strategy == AggregationStrategy.MEAN:
@@ -365,20 +383,11 @@ class SimRegTrainer(BaseTrainer):
         raise NotImplemented
 
     def generic_sim_measure(self, z, h, indices=None, attention_mask=None):
-        sim_methods: Dict[str, SimRegTrainer] = {
+        sim_methods = {
             'cosine': CosineSimReg,
             'cos_cor': CorSimReg,
             'abs_cos_cor': CorSimReg,
             'linear_cka': LinCKA,
-            'pwcca': PWCCAReg,
-            'opd': OPDReg,
-            'fo_cosine': FOCosine,
-            'kl_loss': KLReg,
-            'cross_entropy': CEReg,
-            'cosine_self': CosSelfReg,
-            'l2_self': L2SelfReg,
-            'entropy_reg': AttentionEntropyReg,
-            'aggregated_ce': AggCEReg
         }
         if self.args.regularization_method == 'abs_cos_cor':
             kwargs = {'abs_cor': True}
@@ -387,23 +396,20 @@ class SimRegTrainer(BaseTrainer):
         return sim_methods[self.args.regularization_method].sim_measure(z, h, indices=indices, attention_mask=attention_mask, **kwargs)
 
 
+
 class CosineSimReg(SimRegTrainer):
     @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None):
-        n = z.shape[0]
-        z = z.view((z.shape[0], -1))
-        h = h.view((h.shape[0], -1))
+    def sim_measure(cls, z, h, return_components=False,attention_mask=None, indices=None):
+        # n = z.shape[0]
+        z = z.view(z.shape[0], -1)
+        h = h.view(h.shape[0], -1)
         z = normalize(z, p=2, dim=1)
         h = normalize(h, p=2, dim=1)
         z_RSM = z @ z.t()
         h_RSM = h @ h.t()
-        raise NotImplementedError
-        # TODO: fix this equation, it has something wrong in its logic.
-        mid_op = z_RSM - (1-h_RSM)
-        if return_components:
-            return mid_op
-        mid_op = mid_op.flatten()[1:].view(n-1, n+1)[:, :-1]
-        return mid_op.norm()
+        return (1 - (z_RSM - h_RSM) ** 2).mean()
+        # mid_op = mid_op.flatten()[1:].view(n-1, n+1)[:, :-1]
+        # return (mid_op ** 2).sum()
 
     @classmethod
     def sim_measure_combinations(cls, z, h, bias_indices):
@@ -495,9 +501,6 @@ class CKAReg(SimRegTrainer):
         # As along as batch size < 90, this computation is faster than direct multiplication
         z = z.view((z.shape[0], -1))
         h = h.view((h.shape[0], -1))
-        if indices is not None:
-            z = z[indices]
-            h = h[indices]
         K_z = cls.center(cls.kernel(z), unbiased=True)
         K_h = cls.center(cls.kernel(h), unbiased=True)
 
@@ -519,9 +522,23 @@ class CKAReg(SimRegTrainer):
         #         other_exp = torch.sum(K_h[mask] * K_z[mask])
         #     return other_exp + scaled_hsic
 
-        scaled_hsic = torch.sum(K_h * K_z)
-        x_norm = torch.norm(K_z, p='fro')
-        y_norm = torch.norm(K_h, p='fro')
+        if indices is not None:
+            product = K_h * K_z
+            scaled_hsic = (product)[indices, :].sum()
+            with torch.no_grad():
+                from numpy import setdiff1d, arange
+                non_bias_indices = setdiff1d(arange(K_h.shape[0]), indices, assume_unique=True)
+                other_term = product[non_bias_indices, :].sum()
+                x_norm_term = (K_z[non_bias_indices] ** 2).sum()
+                y_norm_term = (K_h[non_bias_indices] ** 2).sum()
+
+            x_norm = ((K_z[indices] ** 2).sum() + x_norm_term).sqrt()
+            y_norm = ((K_h[indices] ** 2).sum() + y_norm_term).sqrt()
+            scaled_hsic = scaled_hsic + other_term
+        else:
+            scaled_hsic = torch.sum(K_h * K_z)
+            x_norm = torch.norm(K_z, p='fro')
+            y_norm = torch.norm(K_h, p='fro')
         if return_components:
             return K_h * K_z, x_norm, y_norm
 
@@ -534,7 +551,7 @@ class CKAReg(SimRegTrainer):
         norm_factor = (x_norm * y_norm)
         # 1. sim betweeen biased an rest
         bias_rest = (RSM_prod[bias_indices, :].sum() * (RSM_prod.numel() / RSM_prod[bias_indices, :].numel())) / norm_factor
-        # 2. sim between biased and biased
+        # 2. sim between biased and biasedlink
         bias_bias_indices = torch.cartesian_prod(bias_indices, bias_indices)
         bias_bias_indices = (bias_bias_indices[:, 0] * RSM_prod.shape[0]) + bias_bias_indices[:, 1]
         bias_bias_sum = RSM_prod.flatten()[bias_bias_indices].sum()
@@ -552,162 +569,3 @@ class LinCKA(CKAReg):
     def kernel(cls, z):
         return z @ z.t()
 
-
-class PWCCAReg(SimRegTrainer):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        # h is weak activations
-        # here we are projecting on main activations
-        return pwcca_distance_choose_best_layer_matrix(z, h, backend='qr', use_layer_matrix='y')
-
-
-class OPDReg(SimRegTrainer):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        return orthogonal_procrustes_distance(z, h)
-
-
-class selfReg(SimRegTrainer):
-    def compute_sim_loss(self, inputs, indices=None):
-        sim_loss = None
-        for i in range(len(self.activations)):
-            main_activations = self.activations[i]
-            main_activations, _ = self.extract_relevant_activations(
-                inputs,
-                main_activations,
-                batch_bias_indices=indices,
-                regularized_tokens=self.args.regularized_tokens[i],
-                aggregation_strategy=self.args.token_aggregation_strategy[i]
-            )
-            if sim_loss is None:
-                sim_loss = self.generic_sim_measure(main_activations, None, indices, attention_mask=inputs['attention_mask'])
-            else:
-                sim_loss = sim_loss + self.generic_sim_measure(main_activations, None, indices, attention_mask=inputs['attention_mask'])
-        return sim_loss
-        # labels = inputs['labels'][indices]
-        # sim_loss = torch.tensor(0.0, device=labels.device)
-        # count = 0
-        # for i in range(self.model.config.num_labels):
-        #     label_indices = labels == i
-        #     n = torch.sum(label_indices)
-        #     if n <= 1:
-        #         continue
-        #     k = self.sim_measure(main_activations[label_indices], weak_activations[label_indices])
-        #     sim_loss = k if sim_loss is None else sim_loss + k
-        #     count += (n * n-1) / 2
-        # if count > 0:
-        #     sim_loss /= count
-        # return sim_loss
-
-
-class CosSelfReg(selfReg):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None):
-        z = z - z.mean(dim=0)
-        if indices is not None:
-            z = z[indices]
-        z = torch.nn.functional.normalize(z, dim=1)
-        norms = torch.matmul(z, z.t())
-        n = norms.shape[0]
-        return norms.flatten()[1:].view(n-1, n+1)[:, :-1].abs().mean()
-
-
-class L2SelfReg(selfReg):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        n = z.shape[0]
-        z = z.contiguous()
-        return -torch.cdist(z, z, p=2).flatten()[1:].view(n-1, n+1)[:, :-1].sum()
-
-
-class AttentionEntropyReg(selfReg):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        if indices is not None:
-            z = z[indices]
-            attention_mask = attention_mask[indices]
-        # this expression gets the probability vectors for non-PAD tokens in each attention head.
-        z = log_softmax(z[attention_mask.unsqueeze(-1).expand(-1, -1, z.shape[1]).transpose(1, 2).bool()], -1)
-        # taking negative of entropy, in order to maximize it.
-        return (z.exp() * z).sum(dim=-1).mean()
-
-
-# First order cosine similarity
-class FOCosine(SimRegTrainer):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        # h is weak activations
-        # here we are projecting on main activations
-        if indices is not None:
-            z = z[indices]
-            h = h[indices]
-            if len(z) == 0:
-                return torch.tensor(0)
-
-        z = z.view((z.shape[0], -1))
-        h = h.view((h.shape[0], -1))
-        z = normalize(z, p=2, dim=1)
-        h = normalize(h, p=2, dim=1)
-        return torch.norm((z * h).sum(dim=-1))
-
-
-# Kullback-Leibler divergence
-class KLReg(SimRegTrainer):
-    # input must be attention scores!
-    kl_loss = KLDivLoss(reduction='batchmean', log_target=True)
-
-    @classmethod
-    def extract_relevant_probabity_scores(cls, z, h, indices, attention_mask):
-        if indices is not None:
-            z = z[indices]
-            h = h[indices]
-            attention_mask = attention_mask[indices]
-            if len(z) == 0:
-                return torch.tensor(0)
-        z = log_softmax(z[attention_mask.unsqueeze(-1).expand(-1, -1, z.shape[1]).transpose(1, 2).bool()], -1)
-        h = log_softmax(h[attention_mask.unsqueeze(-1).expand(-1, -1, h.shape[1]).transpose(1, 2).bool()], -1)
-        return z, h, attention_mask
-
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        """
-        :param z: main model attention scores
-        :param h: weak model attention scores, same shape as main model
-        :param indices: indices of biased samples
-        :return: mean of KL divergence of probs.
-        """
-        z, h, attention_mask = cls.extract_relevant_probabity_scores(z, h, indices, attention_mask)
-        return -cls.kl_loss(z, h)
-
-
-# Cross entropy regularizer
-class CEReg(KLReg):
-    # input must be attention scores!
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        """
-        :param z: main model attention scores
-        :param h: weak model attention scores, same shape as main model
-        :param indices: indices of biased samples
-        :return: negative mean of `symmetric cross entropy` between the attention of the two models.
-        """
-        z, h, attention_mask = cls.extract_relevant_probabity_scores(z, h, indices, attention_mask)
-        return (z.exp() * h).sum(dim=-1).mean()
-
-
-class AggCEReg(KLReg):
-    @classmethod
-    def sim_measure(cls, z, h, return_components=False, indices=None, attention_mask=None):
-        if indices is not None:
-            z = z[indices]
-            h = h[indices]
-            attention_mask = attention_mask[indices]
-            if len(z) == 0:
-                return torch.tensor(0)
-        # activations shape: b_size, n_heads, n_tokens, n_tokens
-        z = z.sum(dim=1)
-        h = h.sum(dim=1)
-        # activations shape: b_size, n_tokens, n_tokens
-        z = z[attention_mask.bool()].log_softmax(-1)
-        h = h[attention_mask.bool()].log_softmax(-1)
-        return (z.exp() * h).sum(dim=-1).mean()

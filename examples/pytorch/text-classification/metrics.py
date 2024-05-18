@@ -7,10 +7,13 @@ from datasets import load_metric
 from arguments_classes import DataTrainingArguments
 
 
-def hans_compute_metrics(p: EvalPrediction):
+def hans_compute_metrics(p: EvalPrediction, old_labels_order=False):
     preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
     preds = np.argmax(preds, axis=1)
-    preds[preds == 2] = 1
+    if old_labels_order:
+        preds[preds == 2] = 0
+    else:
+        preds[preds == 2] = 1
     return {"accuracy": simple_accuracy(preds, p.label_ids)}
 
 
@@ -40,7 +43,7 @@ def simple_accuracy(preds: ndarray, labels: ndarray):
 def get_metrics_function(is_regression, data_args: DataTrainingArguments, synthetic_bias_indices: dict = None, poe_adustment=False):
     # Get the metric function
     if data_args.task_name is not None and data_args.task_name not in ('fever',):
-        metric = load_metric("glue", data_args.task_name)
+        metric = load_metric("glue", data_args.task_name, )
     else:
         metric = load_metric("accuracy")
 
@@ -55,9 +58,8 @@ def get_metrics_function(is_regression, data_args: DataTrainingArguments, synthe
         if poe_adustment:
             preds = flip_predictions_poe(preds)
 
-        if not is_regression:
-            probs = softmax(preds, axis=-1)
-            entropy = float(np.exp((-probs * np.log(probs)).sum(axis=-1).mean()))
+        probs = softmax(preds, axis=-1)
+        entropy = float(np.exp((-probs * np.log(probs)).sum(axis=-1).mean()))
         preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
         if data_args.task_name is not None:
             result: dict = metric.compute(predictions=preds, references=p.label_ids)
@@ -71,16 +73,13 @@ def get_metrics_function(is_regression, data_args: DataTrainingArguments, synthe
                 result.update(prefix_keys(duplicate_results, 'dup'))
                 result.update(prefix_keys(non_duplicate_results, 'non_dup'))
 
-            if not is_regression:
-                result['entropy'] = entropy
+            result['entropy'] = entropy
             if synthetic_bias_indices is not None:
                 # compute acc on each subset
                 acc_result = (preds == p.label_ids).astype(np.float32)
                 result['synthetic_bias_acc'] = acc_result[biased_indices].mean().item()
                 result['synthetic_anti_bias_acc'] = acc_result[anti_biased_indices].mean().item()
             return result
-        elif is_regression:
-            return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
         else:
             return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
     return compute_metrics

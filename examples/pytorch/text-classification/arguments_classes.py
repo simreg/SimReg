@@ -85,14 +85,20 @@ class DataTrainingArguments:
     # EDIT
     indices_dir: Optional[List[str]] = field(default=None, metadata={"help": "list of directories containing split "
                                                                              "indices of the dataset for evaluation (MNLI matched)"})
-    mismatched_indices_dir: Optional[List[str]] = field(default=None, metadata={"help": "list of directories containing split "
-                                                                             "indices of the dataset for evaluation (MNLI miss-matched)"})
+    mismatched_indices_dir: Optional[List[str]] = field(default=None,
+                                                        metadata={"help": "list of directories containing split "
+                                                                          "indices of the dataset for evaluation (MNLI miss-matched)"})
     synthetic_bias_prevalence: float = field(default=0.0,
                                              metadata={'help': 'ratio of samples to be injected with bias token'})
     bias_correlation_prob: float = field(default=0.8, metadata={'help': 'ratio of bias token aligning with true label'})
-    hypothesis_only: bool = field(default=False, metadata={'help': 'Use only the hypothesis (second sentence) as input'})
+    hypothesis_only: bool = field(default=False,
+                                  metadata={'help': 'Use only the hypothesis (second sentence) as input'})
     claim_only: bool = field(default=False, metadata={'help': 'Use only the claim (first sentence) as input'})
     lexical_bias_model: bool = field(default=False, metadata={'help': 'Use lexical bias features'})
+    # For compatibility purposes
+    old_lexical_settings: bool = field(default=False,
+                                       metadata={'help': 'True: Use previous method of lexical model (Miki\'s model),'
+                                                         'False: Use Clark\'s lexical model'})
     remove_biased_samples_from_train: bool = field(
         default=False,
         metadata={'help': 'remove biased samples from training dataset to measure effect (one time thing)'}
@@ -101,6 +107,8 @@ class DataTrainingArguments:
         default=False,
         metadata={'help': "select biased samples from training dataset to measure effect (one time thing)"}
     )
+    old_labels_order: bool = field(default=False, metadata={
+        'help': 'use old labels order (from previous transformers library version)'})
 
     def __post_init__(self):
         if self.task_name is not None:
@@ -119,6 +127,7 @@ class DataTrainingArguments:
                     validation_extension == train_extension
             ), "`validation_file` should have the same extension (csv or json) as `train_file`."
             assert self.synthetic_bias_prevalence <= 0 or not self.hypothesis_only
+
 
 @dataclass
 class ModelArguments:
@@ -154,16 +163,24 @@ class ModelArguments:
                     "with private models)."
         },
     )
-    randomly_initialize_model: bool = field(default=False, metadata={"help": "randomly initialize the weights of the main model (used to train bias "
-                                                                       "models in unknown-bias settings)"})
-    freeze_embeddings: bool = field(default=False, metadata={"help": "freeze embeddings of the  main model (used to train bias models in "
-                                                                     "unknown-bias settings)"})
+    randomly_initialize_model: bool = field(default=False, metadata={
+        "help": "randomly initialize the weights of the main model (used to train bias "
+                "models in unknown-bias settings)"})
+    freeze_embeddings: bool = field(default=False, metadata={
+        "help": "freeze embeddings of the  main model (used to train bias models in "
+                "unknown-bias settings)"})
 
-    freeze_encoder: bool = field(default=False, metadata={'help': 'freeze encoder of the main model in BERT based models'})
+    freeze_encoder: bool = field(default=False,
+                                 metadata={'help': 'freeze encoder of the main model in BERT based models'})
+    new_clf_head: bool = field(default=False, metadata={'help': 'Randomly initialize the classification head'})
+
+
+@dataclass
+class MethodArgs:
+    # TODO: add my args here if it all works out.
+    pass
 
 
 @dataclass
 class WandbArguments:
     tags: Optional[List[str]] = field(default=None, metadata={'help': 'WANDB tags to assign to this run'})
-    wandb_group: bool = field(default=False, metadata={'help': 'use run name as group name in W&B'})
-

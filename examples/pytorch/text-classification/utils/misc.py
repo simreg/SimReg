@@ -1,8 +1,13 @@
+import os
 from typing import NamedTuple, Optional, Callable, Dict
+
+import regex
 from datasets import Dataset
 from transformers import EvalPrediction, PretrainedConfig
 from os import path
 import json
+
+from arguments_classes import WandbArguments
 
 ROOT_DIR = path.abspath('../../../')
 DATA_DIR = path.join(ROOT_DIR, 'data')
@@ -15,12 +20,6 @@ lexical_bias_cache_mapper = {
         'test_matched': path.join(DATA_DIR, 'mnli_bias_features_without_neg/mnli_hans_test_matched.cache'),
         'test_mismatched': path.join(DATA_DIR, 'mnli_bias_features_without_neg/mnli_hans_test_mismatched.cache'),
         'hans': path.join(DATA_DIR, 'hans_lexical_features_dataset_without_neg/hans_lexical_features_validation.cache')
-    },
-    'qqp': {
-        'train': path.join(DATA_DIR, 'QQP_lexical_features/qqp_lexical_features_train.cache'),
-        'validation': path.join(DATA_DIR, 'QQP_lexical_features/qqp_lexical_features_validation.cache'),
-        'test': path.join(DATA_DIR, 'QQP_lexical_features/qqp_lexical_features_test.cache'),
-        'paws_test': path.join(DATA_DIR, 'QQP_lexical_features/paws_lexical_features_test.cache')
     }
 }
 
@@ -53,3 +52,18 @@ def is_partial_input_model(config: PretrainedConfig):
     return (hasattr(config, 'hypothesis_only') and config.hypothesis_only) or (hasattr(config, 'claim_only') and config.claim_only)
 
 
+def setup_wandb(data_args, wandb_args, training_args):
+    if data_args.synthetic_bias_prevalence > 0:
+        os.environ.setdefault('WANDB_PROJECT', 'synthetic_bias')
+    elif data_args.task_name is not None:
+        os.environ.setdefault('WANDB_PROJECT', f'{data_args.task_name}_exps')
+    if wandb_args.tags is not None:
+        os.environ.setdefault('WANDB_TAGS', ",".join(wandb_args.tags))
+    group_name = training_args.run_name
+    import regex
+    r = regex.match("(.*)_s\d+", group_name)
+    if r:
+        group_name = r.groups()[0]
+    os.environ.setdefault('WANDB_RUN_GROUP', group_name)
+    del regex
+    del r

@@ -1,27 +1,13 @@
 import json
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Optional
 import argparse
-
 import torch
 from datasets import load_dataset
-
-from transformers.utils.versions import require_version
-
 logger = logging.getLogger(__name__)
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 task_to_keys = {
-    "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
-    "mrpc": ("sentence1", "sentence2"),
-    "qnli": ("question", "sentence"),
     "qqp": ("question1", "question2"),
-    "rte": ("sentence1", "sentence2"),
-    "sst2": ("sentence", None),
-    "stsb": ("sentence1", "sentence2"),
-    "wnli": ("sentence1", "sentence2"),
     "fever": ("claim", "evidence")
 }
 
@@ -119,13 +105,11 @@ def main():
     else:
         raise Exception('Please select dataset (eval/train)')
     dataset = raw_datasets[ds_name]
+    labels = torch.tensor(dataset['label']).flatten()
     if args.old_labels_order:
         # datasets module MNLI labels order: entailment, neutral, contradiction.
         # POE project mnli labels order: contradiction, entailment, neutral
-        mapper = {0: 1, 1: 2, 2: 0}
-        labels = torch.tensor(list(map(lambda x: mapper[x], dataset['label']))).flatten()
-    else:
-        labels = torch.tensor(dataset['label']).flatten()
+        labels = (labels + 1) % 3
 
     os.makedirs(args.output_dir, exist_ok=True)
     model1_logits = torch.tensor(torch.load(args.logits_path))
@@ -139,8 +123,9 @@ def main():
         torch.save(hard_indices, os.path.join(args.output_dir, f"{ds_name}_hard_indices.bin"))
         torch.save(correct_indices, os.path.join(args.output_dir, f"{ds_name}_correct_indices.bin"))
     else:
-        biased_indices = torch.nonzero(model1_probs.max(dim=-1)[0] >= args.bias_threshold).squeeze()
-        unconfident_indices = torch.nonzero(model1_probs.max(dim=-1)[0] <= args.unconfident_threshold).squeeze()
+        probs = model1_probs.max(dim=-1).values
+        biased_indices = torch.nonzero(probs >= args.bias_threshold).squeeze()
+        unconfident_indices = torch.nonzero(probs <= args.unconfident_threshold).squeeze()
         labels = labels[biased_indices]
 
         biased_correct_indices = biased_indices[model1_preds[biased_indices] == labels]
@@ -150,17 +135,15 @@ def main():
         print(f"biased_correct_indices.shape: {biased_correct_indices.shape}")
         print(f"unconfident_indices.shape: {unconfident_indices.shape}")
 
-
         torch.save(biased_correct_indices, os.path.join(args.output_dir, f"{ds_name}_biased_correct_indices.bin"))
         torch.save(anti_biased_indices, os.path.join(args.output_dir, f"{ds_name}_anti_biased_indices.bin"))
-        # torch.save(unconfident_indices, os.path.join(args.output_dir, f"{ds_name}_unconfident_indices.bin"))
 
-    # hans_samples = torch.nonzero(model1_preds == labels)
-    # anti_hans_samples = torch.nonzero(model1_preds != labels)
-    # hans_confident_samples = torch.nonzero(model1_probs.max(dim=-1)[0] > 0.7)
-    # hans_correct_confident_samples = torch.nonzero((model1_probs.max(dim=-1)[0] > 0.7) & (model1_preds == labels))
-    # hans_confident_mistakes = torch.nonzero((model1_probs.max(dim=-1)[0] > 0.7) & (model1_preds != labels))
     json.dump(args.__dict__, open(os.path.join(args.output_dir, f'{ds_name}_data_extraction_config.json'), 'w'))
+    with open(os.path.join(args.output_dir, "stats.txt"), "a") as f:
+        f.write(f"anti_biased_indices.shape: {anti_biased_indices.shape}\n")
+        f.write(f"biased_correct_indices.shape: {biased_correct_indices.shape}\n")
+        f.write(f"unconfident_indices.shape: {unconfident_indices.shape}\n")
+
 
 
 if __name__ == '__main__':

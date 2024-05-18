@@ -10,7 +10,7 @@ def format_label(label):
 
 fi = open(sys.argv[1], "r")
 
-first = True
+first = False
 guess_dict = {}
 for line in fi:
     if first:

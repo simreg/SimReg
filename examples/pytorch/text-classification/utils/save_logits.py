@@ -1,5 +1,8 @@
 #!/usr/bin/env python
 # coding=utf-8
+import sys
+
+sys.path.insert(0, "/home/redaigbaria/research_project/examples/pytorch/text-classification/")
 
 import logging
 import os
@@ -22,6 +25,7 @@ def main():
 
     if training_args.do_train:
         ds_name = 'train'
+        print("using train subset")
         predict_dataset = trainer.train_dataset
     elif training_args.do_eval:
         ds_name = 'validation_matched' if data_args.task_name == 'mnli' else 'validation'
@@ -30,8 +34,9 @@ def main():
         raise Exception('Please select dataset (eval/train)')
 
     # Removing the `label` columns because it contains -1 and Trainer won't like that.
-    predict_dataset = predict_dataset.remove_columns("label")
-    predictions = torch.from_numpy(trainer.predict(predict_dataset, metric_key_prefix="predict").predictions)
+    # predict_dataset = predict_dataset.remove_columns("label")
+    predictions = trainer.predict(predict_dataset, metric_key_prefix="predict")
+    predictions = torch.from_numpy(predictions.predictions)
     torch.save(predictions, os.path.join(training_args.output_dir, f"{ds_name}_logits.bin"))
     logging.info(f'saved logits of {model_args.model_name_or_path} to {training_args.output_dir} successfully')
 
